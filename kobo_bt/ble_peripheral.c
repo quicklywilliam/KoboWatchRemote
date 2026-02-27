@@ -201,6 +201,9 @@ typedef INT32 (*fn_gatts_stop_service)(INT32 server_if, INT32 service_handle);
 typedef INT32 (*fn_gatts_send_response)(INT32 conn_id, INT32 trans_id, INT32 status, INT32 handle, CHAR *p_value, INT32 value_len, INT32 auth_req);
 typedef INT32 (*fn_gattc_base_init)(MTKRPCAPI_BT_APP_GATTC_CB_FUNC_T *func, void* pv_tag);
 typedef INT32 (*fn_gattc_register_app)(CHAR *app_uuid);
+typedef INT32 (*fn_gattc_multi_adv_enable)(INT32 client_if, INT32 min_interval, INT32 max_interval, INT32 adv_type, INT32 chnl_map, INT32 tx_power, INT32 timeout_s);
+typedef INT32 (*fn_gattc_multi_adv_setdata)(INT32 client_if, UINT8 set_scan_rsp, UINT8 include_name, UINT8 include_txpower, INT32 appearance, INT32 manufacturer_len, CHAR* manufacturer_data, INT32 service_data_len, CHAR* service_data, INT32 service_uuid_len, CHAR* service_uuid);
+typedef INT32 (*fn_gattc_multi_adv_disable)(INT32 client_if);
 
 /* BLE 5.0 Advertising Set API structs (reverse-engineered from RPC descriptors) */
 struct __attribute__((packed)) AdvSetParams {
@@ -273,6 +276,9 @@ static fn_gatts_stop_service g_stop_service = NULL;
 static fn_gatts_start_service g_start_service = NULL;
 static fn_gattc_start_adv_set g_start_adv_set = NULL;
 static fn_gattc_stop_adv_set g_stop_adv_set = NULL;
+static fn_gattc_multi_adv_enable g_multi_adv_enable = NULL;
+static fn_gattc_multi_adv_setdata g_multi_adv_setdata = NULL;
+static fn_gattc_multi_adv_disable g_multi_adv_disable = NULL;
 
 /* --- Input injection --- */
 
@@ -329,7 +335,36 @@ static void build_scan_rsp(struct AdvSetData *sr) {
 }
 
 static INT32 start_legacy_advertising(void) {
-    if (!g_start_adv_set || g_client_if < 0) return -1;
+    if (g_client_if < 0) return -1;
+    INT32 ret;
+
+    /* Step 1: Start multi_adv to prime the advertising instance.
+     * multi_adv alone produces extended ADV_EXT_IND (visible on iPhone/Mac
+     * but NOT on Apple Watch). However it seems to be required to initialize
+     * the advertising state before start_advertising_set will work. */
+    if (g_multi_adv_enable) {
+        printf("Priming with multi_adv (client_if=%d)...\n", g_client_if);
+        ret = g_multi_adv_enable(g_client_if, 96, 160, 0, 7, 7, 0);
+        printf("multi_adv_enable: ret=%d\n", ret);
+        if (ret == 0) {
+            sleep(1);
+            /* Set advertising data */
+            g_multi_adv_setdata(g_client_if,
+                0, 1, 0, 0, 0, NULL, 0, NULL,
+                strlen(SERVICE_UUID), SERVICE_UUID);
+            g_multi_adv_setdata(g_client_if,
+                1, 1, 0, 0, 0, NULL, 0, NULL,
+                strlen(SERVICE_UUID), SERVICE_UUID);
+            sleep(1);
+            /* Stop multi_adv before switching to adv_set */
+            g_multi_adv_disable(g_client_if);
+            sleep(1);
+        }
+    }
+
+    /* Step 2: Start legacy advertising via start_advertising_set.
+     * evt_props=0x0013 forces legacy ADV_IND PDUs which Apple Watch can see. */
+    if (!g_start_adv_set) return -1;
 
     struct AdvSetParams ap;
     memset(&ap, 0, sizeof(ap));
@@ -350,7 +385,7 @@ static INT32 start_legacy_advertising(void) {
     memset(&pp, 0, sizeof(pp));
 
     printf("Starting legacy advertising (client_if=%d)...\n", g_client_if);
-    INT32 ret = g_start_adv_set(g_client_if, &ap, &ad, &sr, &pp, &pd, 0, 0);
+    ret = g_start_adv_set(g_client_if, &ap, &ad, &sr, &pp, &pd, 0, 0);
     printf("start_advertising_set: ret=%d\n", ret);
     return ret;
 }
@@ -559,6 +594,9 @@ int main(int argc, char *argv[]) {
     LOAD_SYM(lib, fn_gatts_stop_service, a_mtkapi_bt_gatts_stop_service);
     LOAD_SYM(lib, fn_gatts_send_response, a_mtkapi_bt_gatts_send_response);
     LOAD_SYM(lib, fn_gattc_register_app, a_mtkapi_bt_gattc_register_app);
+    LOAD_SYM(lib, fn_gattc_multi_adv_enable, a_mtkapi_bt_gattc_multi_adv_enable);
+    LOAD_SYM(lib, fn_gattc_multi_adv_setdata, a_mtkapi_bt_gattc_multi_adv_setdata);
+    LOAD_SYM(lib, fn_gattc_multi_adv_disable, a_mtkapi_bt_gattc_multi_adv_disable);
     LOAD_SYM(lib, fn_gattc_start_adv_set, a_mtkapi_bt_gattc_start_advertising_set);
     LOAD_SYM(lib, fn_gattc_stop_adv_set, a_mtkapi_bt_gattc_stop_advertising_set);
 
@@ -567,6 +605,9 @@ int main(int argc, char *argv[]) {
     g_start_service = a_mtkapi_bt_gatts_start_service;
     g_start_adv_set = a_mtkapi_bt_gattc_start_advertising_set;
     g_stop_adv_set = a_mtkapi_bt_gattc_stop_advertising_set;
+    g_multi_adv_enable = a_mtkapi_bt_gattc_multi_adv_enable;
+    g_multi_adv_setdata = a_mtkapi_bt_gattc_multi_adv_setdata;
+    g_multi_adv_disable = a_mtkapi_bt_gattc_multi_adv_disable;
 
     /* Initialize RPC connection to btservice */
     ret = a_mtk_bt_service_init();
