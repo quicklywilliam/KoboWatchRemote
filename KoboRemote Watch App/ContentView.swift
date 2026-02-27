@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     var ble = BLEManager.shared
+    var actionState = ActionState.shared
     @State private var crownValue = 0.0
     @State private var lastCrownTick = 0
 
@@ -55,6 +56,11 @@ struct ContentView: View {
         .animation(.easeInOut(duration: 0.2), value: ble.lastAction)
         .focusable()
         .digitalCrownRotation($crownValue, from: -1000, through: 1000, sensitivity: .low, isContinuous: true)
+        .onChange(of: actionState.triggered) {
+            if actionState.triggered {
+                ble.sendNextPage()
+            }
+        }
         .onChange(of: crownValue) {
             let tick = Int(crownValue)
             if tick != lastCrownTick {
