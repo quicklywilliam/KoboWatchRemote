@@ -6,8 +6,8 @@ WatchOS app that acts as a BLE central, connecting to a Kobo e-reader running as
 ## BLE Protocol
 
 - **Kobo advertises as**: "Kobo Libra Colour"
-- **Service UUID**: `12345678-1234-5678-1234-56789abcdef0`
-- **Characteristic UUID**: `12345678-1234-5678-1234-56789abcdef1`
+- **Service UUID**: `0b278e49-7f56-4788-a1bb-4624e0d64b46`
+- **Characteristic UUID**: `5257acb0-be4d-4cf1-af8f-cbdb67bf998a`
 - **Characteristic properties**: Read, Write, Notify
 
 ### Commands (write to characteristic)
@@ -22,7 +22,7 @@ Reading the characteristic returns a single byte with the last command received 
 ## Architecture
 - **WatchOS-only app** (no iOS companion needed for BLE central)
 - Use `CoreBluetooth` framework (`CBCentralManager`, `CBPeripheral`)
-- Scan for peripherals advertising service UUID `12345678-1234-5678-1234-56789abcdef0`
+- Scan for peripherals advertising service UUID `0b278e49-7f56-4788-a1bb-4624e0d64b46`
 - Connect, discover services/characteristics, then write commands
 
 ## UI
@@ -45,7 +45,7 @@ Reading the characteristic returns a single byte with the last command received 
   from bleak import BleakClient
 
   ADDR = "XX:XX:XX:XX:XX:XX"  # Kobo's BT address
-  CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
+  CHAR_UUID = "5257acb0-be4d-4cf1-af8f-cbdb67bf998a"
 
   async def main():
       async with BleakClient(ADDR) as client:

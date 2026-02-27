@@ -1,0 +1,56 @@
+{
+  "images" : [
+    {
+      "idiom" : "watch",
+      "platform" : "watchOS",
+      "scale" : "2x",
+      "size" : "33x36"
+    },
+    {
+      "idiom" : "watch",
+      "platform" : "watchOS",
+      "scale" : "2x",
+      "size" : "38x42"
+    },
+    {
+      "idiom" : "watch",
+      "platform" : "watchOS",
+      "scale" : "2x",
+      "size" : "40x44"
+    },
+    {
+      "idiom" : "watch",
+      "platform" : "watchOS",
+      "scale" : "2x",
+      "size" : "44x48"
+    },
+    {
+      "idiom" : "watch",
+      "platform" : "watchOS",
+      "scale" : "2x",
+      "size" : "46x50"
+    },
+    {
+      "idiom" : "watch",
+      "platform" : "watchOS",
+      "scale" : "2x",
+      "size" : "51x56"
+    },
+    {
+      "idiom" : "watch",
+      "platform" : "watchOS",
+      "scale" : "2x",
+      "size" : "54x58"
+    },
+    {
+      "idiom" : "watch-marketing",
+      "platform" : "watchOS",
+      "scale" : "1x",
+      "size" : "1024x1024"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

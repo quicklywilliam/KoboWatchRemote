@@ -13,6 +13,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <pthread.h>
 #include <linux/input.h>
 
 /* Type definitions matching MediaTek BT MW */
@@ -200,6 +201,8 @@ typedef INT32 (*fn_gattc_register_app)(CHAR *app_uuid);
 typedef INT32 (*fn_gattc_multi_adv_enable)(INT32 client_if, INT32 min_interval, INT32 max_interval, INT32 adv_type, INT32 chnl_map, INT32 tx_power, INT32 timeout_s);
 typedef INT32 (*fn_gattc_multi_adv_setdata)(INT32 client_if, UINT8 set_scan_rsp, UINT8 include_name, UINT8 include_txpower, INT32 appearance, INT32 manufacturer_len, CHAR* manufacturer_data, INT32 service_data_len, CHAR* service_data, INT32 service_uuid_len, CHAR* service_uuid);
 typedef INT32 (*fn_gattc_multi_adv_disable)(INT32 client_if);
+typedef INT32 (*fn_gattc_set_adv_ext_param)(INT32 client_if, INT32 event_properties, INT32 primary_phy, INT32 secondary_phy, INT32 scan_req_notify_enable);
+typedef INT32 (*fn_gap_send_hci)(CHAR *hci_cmd);
 
 /* Globals */
 static volatile int g_running = 1;
@@ -249,9 +252,82 @@ static void inject_page_turn(int forward) {
     printf("[PAGE] Injected %s page turn\n", forward ? "NEXT" : "PREV");
 }
 
+/* Power button monitoring for sleep/wake handling */
+#define POWER_BTN_DEV "/dev/input/event3"
+#define KEY_POWER 116
+
+static volatile int g_suspended = 0;
+
+/* Function pointers stored globally so sleep handler can use them */
+static fn_gattc_multi_adv_disable g_adv_disable = NULL;
+static fn_gattc_multi_adv_enable g_adv_enable = NULL;
+static fn_gattc_multi_adv_setdata g_adv_setdata = NULL;
+static fn_gatts_stop_service g_stop_service = NULL;
+static fn_gatts_start_service g_start_service = NULL;
+static fn_gattc_set_adv_ext_param g_set_adv_ext_param = NULL;
+
+static void bt_teardown_for_sleep(void) {
+    printf("[SLEEP] Tearing down BT for suspend...\n");
+    if (g_adv_disable && g_client_if >= 0)
+        g_adv_disable(g_client_if);
+    if (g_stop_service && g_server_if >= 0 && g_srvc_handle >= 0)
+        g_stop_service(g_server_if, g_srvc_handle);
+    printf("[SLEEP] BT teardown complete\n");
+}
+
+static void bt_restore_after_wake(void) {
+    printf("[WAKE] Restoring BT after resume...\n");
+    if (g_start_service && g_server_if >= 0 && g_srvc_handle >= 0)
+        g_start_service(g_server_if, g_srvc_handle, 2);
+    if (g_set_adv_ext_param && g_client_if >= 0) {
+        g_set_adv_ext_param(g_client_if, 0x13, 1, 1, 0);
+        usleep(500000);
+    }
+    if (g_adv_enable && g_client_if >= 0) {
+        g_adv_enable(g_client_if, 96, 160, 0, 7, 7, 0);
+        sleep(1);
+    }
+    if (g_adv_setdata && g_client_if >= 0)
+        g_adv_setdata(g_client_if, 0, 1, 0, 0, 0, NULL, 0, NULL,
+                      strlen("0b278e49-7f56-4788-a1bb-4624e0d64b46"),
+                      "0b278e49-7f56-4788-a1bb-4624e0d64b46");
+    printf("[WAKE] BT restore complete\n");
+}
+
+static void *power_button_monitor(void *arg) {
+    struct input_event ev;
+    int fd = open(POWER_BTN_DEV, O_RDONLY);
+    if (fd < 0) {
+        printf("[PWR] Failed to open %s\n", POWER_BTN_DEV);
+        return NULL;
+    }
+    printf("[PWR] Monitoring power button on %s\n", POWER_BTN_DEV);
+
+    while (g_running) {
+        int n = read(fd, &ev, sizeof(ev));
+        if (n != sizeof(ev)) continue;
+        if (ev.type != EV_KEY || ev.code != KEY_POWER) continue;
+
+        if (ev.value == 1) { /* power button pressed */
+            if (!g_suspended) {
+                /* Going to sleep - tear down BT */
+                g_suspended = 1;
+                bt_teardown_for_sleep();
+            } else {
+                /* Waking up - restore BT */
+                g_suspended = 0;
+                sleep(3); /* wait for hardware to come back */
+                bt_restore_after_wake();
+            }
+        }
+    }
+    close(fd);
+    return NULL;
+}
+
 /* Our custom service UUID - "page turn" service for Apple Watch */
-#define SERVICE_UUID    "12345678-1234-5678-1234-56789abcdef0"
-#define CHAR_PAGE_UUID  "12345678-1234-5678-1234-56789abcdef1"
+#define SERVICE_UUID    "0b278e49-7f56-4788-a1bb-4624e0d64b46"
+#define CHAR_PAGE_UUID  "5257acb0-be4d-4cf1-af8f-cbdb67bf998a"
 /* Client Characteristic Configuration Descriptor */
 #define CCCD_UUID       "00002902-0000-1000-8000-00805f9b34fb"
 
@@ -413,11 +489,19 @@ int main(int argc, char *argv[]) {
     LOAD_SYM(lib, fn_gattc_multi_adv_enable, a_mtkapi_bt_gattc_multi_adv_enable);
     LOAD_SYM(lib, fn_gattc_multi_adv_setdata, a_mtkapi_bt_gattc_multi_adv_setdata);
     LOAD_SYM(lib, fn_gattc_multi_adv_disable, a_mtkapi_bt_gattc_multi_adv_disable);
+    LOAD_SYM(lib, fn_gattc_set_adv_ext_param, a_mtkapi_bt_gattc_set_adv_ext_param);
+    LOAD_SYM(lib, fn_gap_send_hci, a_mtkapi_bt_gap_send_hci);
 
     printf("All symbols loaded\n");
 
-    /* Store send_response globally so callbacks can use it */
+    /* Store function pointers globally so callbacks and sleep handler can use them */
     g_send_response = a_mtkapi_bt_gatts_send_response;
+    g_adv_disable = a_mtkapi_bt_gattc_multi_adv_disable;
+    g_adv_enable = a_mtkapi_bt_gattc_multi_adv_enable;
+    g_adv_setdata = a_mtkapi_bt_gattc_multi_adv_setdata;
+    g_stop_service = a_mtkapi_bt_gatts_stop_service;
+    g_start_service = a_mtkapi_bt_gatts_start_service;
+    g_set_adv_ext_param = a_mtkapi_bt_gattc_set_adv_ext_param;
 
     /* Step 0: Initialize RPC connection to btservice */
     setbuf(stdout, NULL); /* Force unbuffered output */
@@ -471,7 +555,7 @@ int main(int argc, char *argv[]) {
 
     /* Step 3: Register GATTC app for advertising */
     printf("Registering GATTC app...\n");
-    ret = a_mtkapi_bt_gattc_register_app("12345678-1234-5678-1234-56789abcdef2");
+    ret = a_mtkapi_bt_gattc_register_app("d3f8a120-5c6e-4a93-b8d2-9e7f01234abc");
     printf("gattc_register_app: ret=%d\n", ret);
     sleep(3);
 
@@ -526,22 +610,18 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Step 9: Enable BLE advertising
-     * ADV_IND (type 0) = connectable undirected advertising
-     * interval 160 = 100ms (units of 0.625ms)
-     * channel map 7 = all channels (37, 38, 39)
-     * Try multiple client_if values if the callback one fails */
+    /* Step 9: Enable BLE advertising via multi_adv API */
     {
         INT32 adv_client = g_client_if;
         int adv_ok = 0;
         for (int try = 0; try < 8 && !adv_ok; try++) {
             printf("Enabling BLE advertising (client_if=%d)...\n", adv_client);
             ret = a_mtkapi_bt_gattc_multi_adv_enable(adv_client,
-                                                      160,  /* min interval (100ms) */
-                                                      320,  /* max interval (200ms) */
+                                                      96,   /* min interval (60ms) */
+                                                      160,  /* max interval (100ms) */
                                                       0,    /* ADV_IND */
                                                       7,    /* all channels */
-                                                      1,    /* tx power */
+                                                      7,    /* tx power */
                                                       0);   /* no timeout */
             printf("multi_adv_enable: ret=%d\n", ret);
             if (ret == 0) {
@@ -554,23 +634,42 @@ int main(int argc, char *argv[]) {
         }
         sleep(1);
 
-        /* Step 10: Set advertising data */
         printf("Setting advertising data...\n");
         ret = a_mtkapi_bt_gattc_multi_adv_setdata(g_client_if,
-                                                   0,    /* not scan response */
-                                                   1,    /* include name */
-                                                   0,    /* don't include tx power */
-                                                   0,    /* appearance */
-                                                   0, NULL, /* no manufacturer data */
-                                                   0, NULL, /* no service data */
+                                                   0, 1, 0, 0,
+                                                   0, NULL, 0, NULL,
                                                    strlen(SERVICE_UUID), SERVICE_UUID);
         printf("multi_adv_setdata: ret=%d\n", ret);
+
+        printf("Setting scan response data...\n");
+        ret = a_mtkapi_bt_gattc_multi_adv_setdata(g_client_if,
+                                                   1, 1, 0, 0,
+                                                   0, NULL, 0, NULL,
+                                                   strlen(SERVICE_UUID), SERVICE_UUID);
+        printf("multi_adv_scanrsp: ret=%d\n", ret);
+    }
+
+    /* Also set GAP connectable+discoverable - this may trigger legacy advertising */
+    printf("Setting GAP connectable and discoverable...\n");
+    {
+        typedef INT32 (*fn_gap_set_conn_disc)(UINT8 connectable, UINT8 discoverable);
+        fn_gap_set_conn_disc set_conn_disc = (fn_gap_set_conn_disc)dlsym(lib, "a_mtkapi_bt_gap_set_connectable_and_discoverable");
+        if (set_conn_disc) {
+            ret = set_conn_disc(1, 1);
+            printf("set_connectable_and_discoverable: ret=%d\n", ret);
+        } else {
+            printf("set_connectable_and_discoverable: symbol not found\n");
+        }
     }
 
     printf("\n=== BLE Peripheral running ===\n");
     printf("Service UUID: %s\n", SERVICE_UUID);
     printf("Char UUID:    %s\n", CHAR_PAGE_UUID);
     printf("Press Ctrl+C to stop\n\n");
+
+    /* Start power button monitor thread for sleep/wake handling */
+    pthread_t pwr_thread;
+    pthread_create(&pwr_thread, NULL, power_button_monitor, NULL);
 
     /* Main loop - just wait for events */
     while (g_running) {
