@@ -6,6 +6,10 @@ Page turning remotes are great, but why buy a new thing to lose if you already h
 
 [Kobo-btpt](https://github.com/tsowell/kobo-btpt/) and the page turner Kobo sells work by communicating as Bluetooth peripherals. However, Apple's Core Bluetooth library does not allow Apple Watch to act as a peripheral. This plugin allows the *Kobo* to act as a Bluetooth peripheral, thereby enabling an Apple Watch to communicate with it (ie as a BLE central).
 
+## Compatibility
+
+The Kobo code was built for MediaTek-based devices (Clara BW/Colour, Libra Colour, Elipsa 2E) and will not work on others. It probably would be straight forward to implement for older devices, but I do not have one around to build/test on.
+
 ## Components
 
 ### Apple Watch App (`KoboRemote Watch App`)
