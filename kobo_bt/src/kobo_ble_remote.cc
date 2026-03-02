@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <cstdarg>
+#include <ctime>
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -38,6 +40,30 @@
 
 #include "resume_handler.h"
 
+/* Persistent log — survives hard reboot (written to user flash) */
+#define PERSISTENT_LOG "/mnt/onboard/.adds/ble-remote.log"
+static void plog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void plog(const char *fmt, ...)
+{
+    FILE *f = fopen(PERSISTENT_LOG, "a");
+    if (!f) return;
+
+    /* timestamp */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d ",
+            tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
+            tm.tm_hour, tm.tm_min, tm.tm_sec);
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fprintf(f, "\n");
+    fclose(f);
+}
 
 /* ================================================================
  * Nickel symbol pointers (resolved by NickelHook via nh_dlsym)
@@ -76,6 +102,10 @@ static void *g_bt_heartbeat = NULL;
 
 /* ble_peripheral subprocess PID */
 static volatile pid_t g_ble_pid = -1;
+
+/* Set between aboutToSleep and resumedFromSleep to prevent reaper respawn */
+static volatile int g_sleeping = 0;
+
 
 /* Socket server */
 static int g_sock_fd = -1;
@@ -164,23 +194,28 @@ static void spawn_ble_peripheral()
 }
 
 /* ================================================================
- * ResumeHandler — connected to PowerManager::resumed()
+ * Sleep/Resume handler
  * ================================================================ */
+
+void ResumeHandler::onSleep()
+{
+    nh_log("aboutToSleep — killing ble_peripheral");
+    plog("SLEEP: killing ble_peripheral (pid=%d)", g_ble_pid);
+    g_sleeping = 1;
+    pid_t pid = g_ble_pid;
+    if (pid > 0) {
+        kill(pid, SIGTERM);
+        nh_log("sent SIGTERM to ble_peripheral (pid=%d)", pid);
+    }
+    plog("SLEEP: done");
+}
 
 void ResumeHandler::onResume()
 {
-    nh_log("resume detected (PowerManager::resumed)");
-    int fd = g_ble_client_fd;
-    if (fd >= 0) {
-        unsigned char cmd = CMD_HEALTH_CHECK;
-        ssize_t n = write(fd, &cmd, 1);
-        if (n == 1)
-            nh_log("sent health check to ble_peripheral");
-        else
-            nh_log("health check write failed");
-    } else {
-        nh_log("no ble_peripheral connection for health check");
-    }
+    nh_log("resumedFromSleep");
+    plog("RESUME: waking up");
+    spawn_ble_peripheral();
+    g_sleeping = 0;
 }
 
 /* ================================================================
@@ -221,7 +256,10 @@ static void *reaper_thread(void *)
             }
             g_ble_pid = -1;
 
-            if (health_exit) {
+            if (g_sleeping) {
+                nh_log("device is sleeping — not respawning");
+                continue;
+            } else if (health_exit) {
                 nh_log("health check exit — respawning immediately");
                 backoff = 5;
             } else {
@@ -360,18 +398,21 @@ static void *socket_server_thread(void *)
 static int ble_remote_init()
 {
     nh_log("init: starting");
+    plog("INIT: plugin starting");
 
-    /* Connect to N3PowerWorkflowManager::resumedFromSleep() for resume detection.
-     * This fires after the UI is back up (not during kernel resume like
-     * PowerManager::resumed()), so the BT stack is ready by then. */
+    /* Connect to N3PowerWorkflowManager sleep/resume signals.
+     * aboutToSleep: kill ble_peripheral so no stale BT state during deep sleep.
+     * resumedFromSleep: respawn ble_peripheral with fresh BT connections. */
     ResumeHandler *rh = new ResumeHandler();
 
     QObject *pwm = N3PowerWorkflowManager_sharedInstance();
     if (pwm) {
-        bool ok = QObject::connect(pwm, SIGNAL(resumedFromSleep()), rh, SLOT(onResume()));
-        nh_log("N3PowerWorkflowManager::resumedFromSleep() connect: %s", ok ? "OK" : "FAILED");
+        bool ok1 = QObject::connect(pwm, SIGNAL(aboutToSleep()), rh, SLOT(onSleep()));
+        bool ok2 = QObject::connect(pwm, SIGNAL(resumedFromSleep()), rh, SLOT(onResume()));
+        nh_log("aboutToSleep connect: %s", ok1 ? "OK" : "FAILED");
+        nh_log("resumedFromSleep connect: %s", ok2 ? "OK" : "FAILED");
     } else {
-        nh_log("WARNING: no N3PowerWorkflowManager for resume detection");
+        nh_log("WARNING: no N3PowerWorkflowManager for sleep/resume detection");
     }
 
     /* Start socket server thread */

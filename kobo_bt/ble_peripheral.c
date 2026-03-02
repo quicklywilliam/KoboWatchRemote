@@ -28,6 +28,27 @@
 #include <time.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <stdarg.h>
+
+/* Persistent log — survives hard reboot */
+#define PERSISTENT_LOG "/mnt/onboard/.adds/ble-remote.log"
+static void plog(const char *fmt, ...) {
+    FILE *f = fopen(PERSISTENT_LOG, "a");
+    if (!f) return;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm;
+    localtime_r(&ts.tv_sec, &tm);
+    fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d [BLE] ",
+            tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
+            tm.tm_hour, tm.tm_min, tm.tm_sec);
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fprintf(f, "\n");
+    fclose(f);
+}
 
 /* Type definitions matching MediaTek BT MW */
 typedef unsigned char  UINT8;
@@ -245,6 +266,7 @@ typedef INT32 (*fn_gattc_start_adv_set)(INT32 client_if,
     UINT16 duration,
     UINT8 max_ext_adv_events);
 typedef INT32 (*fn_gattc_stop_adv_set)(INT32 client_if);
+typedef INT32 (*fn_gatts_close)(INT32 server_if, CHAR *btaddr);
 
 /* Globals */
 static volatile int g_running = 1;
@@ -298,6 +320,8 @@ static fn_gattc_stop_adv_set g_stop_adv_set = NULL;
 static fn_gattc_multi_adv_enable g_multi_adv_enable = NULL;
 static fn_gattc_multi_adv_setdata g_multi_adv_setdata = NULL;
 static fn_gattc_multi_adv_disable g_multi_adv_disable = NULL;
+static fn_gatts_close g_gatts_close = NULL;
+static fn_gatts_unregister_server g_unregister_server = NULL;
 
 /* Library handle for reinit */
 static void *g_lib = NULL;
@@ -327,6 +351,9 @@ static void send_command(UINT8 cmd) {
         g_sock_fd = -1;
     }
 }
+
+/* Connected device address (for explicit disconnect on shutdown) */
+static CHAR g_connected_btaddr[MAX_BDADDR_LEN] = {0};
 
 /* --- Advertising helpers --- */
 
@@ -425,13 +452,16 @@ static void gatts_event_cb(BT_GATTS_EVENT_T event, void* pv_tag) {
     printf("[GATTS] Event: %d\n", event);
     if (event == BT_GATTS_CONNECT) {
         printf("[GATTS] *** Device connected! ***\n");
+        plog("CONNECT");
         /* Signal main thread to restart advertising — can't call BT
          * middleware from within an RPC callback (deadlock). */
         g_need_readvertise = 1;
         wakeup_main_loop();
     } else if (event == BT_GATTS_DISCONNECT) {
         printf("[GATTS] *** Device disconnected ***\n");
+        plog("DISCONNECT");
         g_conn_id = -1;
+        g_connected_btaddr[0] = '\0';
         g_need_readvertise = 1;
         wakeup_main_loop();
     }
@@ -478,6 +508,7 @@ static void gatts_req_read_cb(BT_GATTS_REQ_READ_RST_T *rst, void* pv_tag) {
     (void)pv_tag;
     printf("[GATTS] Read request from %s\n", rst->btaddr);
     g_conn_id = rst->conn_id;
+    strncpy(g_connected_btaddr, rst->btaddr, MAX_BDADDR_LEN - 1);
 
     if (g_send_response) {
         CHAR value[1] = { (CHAR)g_last_cmd };
@@ -490,6 +521,7 @@ static void gatts_req_write_cb(BT_GATTS_REQ_WRITE_RST_T *rst, void* pv_tag) {
     (void)pv_tag;
     printf("[GATTS] Write request: len=%d from %s\n", rst->length, rst->btaddr);
     g_conn_id = rst->conn_id;
+    strncpy(g_connected_btaddr, rst->btaddr, MAX_BDADDR_LEN - 1);
 
     if (rst->length >= 1) {
         UINT8 cmd = rst->value[0];
@@ -532,6 +564,7 @@ static void gattc_generic_cb(void *rst, void* pv_tag) {
 
 static void sighandler(int sig) {
     (void)sig;
+    plog("SIGTERM received");
     g_running = 0;
 }
 
@@ -540,6 +573,7 @@ static void crash_handler(int sig) {
     if (sig == SIGSEGV) name = "SIGSEGV";
     else if (sig == SIGBUS) name = "SIGBUS";
     else if (sig == SIGABRT) name = "SIGABRT";
+    plog("CRASH: signal %d (%s)", sig, name);
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "\n*** CRASH: signal %d (%s) ***\n", sig, name);
     (void)write(STDERR_FILENO, buf, len);
@@ -572,6 +606,9 @@ static int bt_init(void) {
     g_multi_adv_enable = NULL;
     g_multi_adv_setdata = NULL;
     g_multi_adv_disable = NULL;
+    g_gatts_close = NULL;
+    g_unregister_server = NULL;
+    g_connected_btaddr[0] = '\0';
 
     /* Load the client library */
     g_lib = dlopen("libmtk_bt_service_client.so", RTLD_NOW);
@@ -599,6 +636,8 @@ static int bt_init(void) {
     LOAD_SYM_RET(g_lib, fn_gattc_multi_adv_disable, a_mtkapi_bt_gattc_multi_adv_disable, -1);
     LOAD_SYM_RET(g_lib, fn_gattc_start_adv_set, a_mtkapi_bt_gattc_start_advertising_set, -1);
     LOAD_SYM_RET(g_lib, fn_gattc_stop_adv_set, a_mtkapi_bt_gattc_stop_advertising_set, -1);
+    LOAD_SYM_RET(g_lib, fn_gatts_close, a_mtkapi_bt_gatts_close, -1);
+    LOAD_SYM_RET(g_lib, fn_gatts_unregister_server, a_mtkapi_bt_gatts_unregister_server, -1);
 
     g_send_response = a_mtkapi_bt_gatts_send_response;
     g_stop_service = a_mtkapi_bt_gatts_stop_service;
@@ -607,6 +646,8 @@ static int bt_init(void) {
     g_multi_adv_enable = a_mtkapi_bt_gattc_multi_adv_enable;
     g_multi_adv_setdata = a_mtkapi_bt_gattc_multi_adv_setdata;
     g_multi_adv_disable = a_mtkapi_bt_gattc_multi_adv_disable;
+    g_gatts_close = a_mtkapi_bt_gatts_close;
+    g_unregister_server = a_mtkapi_bt_gatts_unregister_server;
 
     /* Initialize RPC connection to btservice */
     ret = a_mtk_bt_service_init();
@@ -705,6 +746,15 @@ static int bt_init(void) {
 
     /* Start legacy BLE advertising */
     start_legacy_advertising();
+
+    plog("STARTED: server_if=%d client_if=%d srvc=%d char=%d",
+         g_server_if, g_client_if, g_srvc_handle, g_char_handle);
+
+    if (g_srvc_handle < 0 || g_char_handle < 0) {
+        plog("ABORT: GATT service not registered (stale BT state)");
+        fprintf(stderr, "GATT service not registered — exiting for retry\n");
+        return -1;
+    }
 
     printf("\n=== BLE Peripheral running ===\n");
     printf("Service UUID: %s\n", SERVICE_UUID);
@@ -827,15 +877,23 @@ int main(int argc, char *argv[]) {
 
     /* Cleanup */
     int exit_code = g_health_fail ? EXIT_HEALTH_FAIL : 0;
+    plog("SHUTDOWN: exit_code=%d", exit_code);
     printf("\nShutting down (exit code %d)...\n", exit_code);
     if (g_sock_fd >= 0)
         close(g_sock_fd);
+    if (g_gatts_close && g_server_if >= 0 && g_connected_btaddr[0]) {
+        plog("DISCONNECTING: server_if=%d btaddr=%s", g_server_if, g_connected_btaddr);
+        g_gatts_close(g_server_if, g_connected_btaddr);
+    }
     if (g_stop_adv_set && g_client_if >= 0)
         g_stop_adv_set(g_client_if);
-    if (g_server_if >= 0 && g_stop_service)
+    if (g_server_if >= 0 && g_stop_service && g_srvc_handle >= 0)
         g_stop_service(g_server_if, g_srvc_handle);
+    if (g_server_if >= 0 && g_unregister_server)
+        g_unregister_server(g_server_if);
     if (g_lib)
         dlclose(g_lib);
+    plog("EXIT: done");
     printf("Done.\n");
     return exit_code;
 }

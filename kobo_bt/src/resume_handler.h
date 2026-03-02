@@ -6,6 +6,7 @@
 class ResumeHandler : public QObject {
     Q_OBJECT
 public slots:
+    void onSleep();
     void onResume();
 };
 
