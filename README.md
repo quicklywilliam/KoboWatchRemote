@@ -1,6 +1,6 @@
 # Apple Watch Kobo Page Turner
 
-![demo](https://github.com/user-attachments/assets/37a65574-2fff-4d0a-9343-ac39d6a8d173)
+<img src="https://github.com/user-attachments/assets/37a65574-2fff-4d0a-9343-ac39d6a8d173" width="500" />
 
 Page turning remotes are great, but why buy a new thing to lose if you already have a perfectly capable device on your wrist?
 
