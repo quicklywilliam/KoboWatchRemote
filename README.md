@@ -56,5 +56,7 @@ Shared library loaded into Nickel's process via [NickelHook](https://github.com/
 
 ```sh
 cd kobo_bt
-docker run --rm -v "$(pwd):/work" -w /work ghcr.io/pgaskin/nickeltc:1 make koboroot
+docker run --rm -v "$(pwd)/..:/work" -w /work/kobo_bt ghcr.io/pgaskin/nickeltc:1 make dist
 ```
+
+Produces `KoboRoot.tgz` in the project root.
